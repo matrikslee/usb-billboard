@@ -1,36 +1,20 @@
-
-use std::time::Duration;
-use std::io::{self, Write};
-use smol::io::AsyncBufReadExt;
 use clap::{Parser, Subcommand};
 use nusb::transfer::{ControlIn, ControlOut, ControlType, Recipient};
+use smol::io::AsyncBufReadExt;
+use std::io::{self, Write};
+use std::time::Duration;
 
-// --- 厂商请求定义 (对应 C 代码宏) ---
+// --- 厂商请求定义 ---
 // IN Requests
-const REQ_GET_HARDWARE_STATUS: u8 = 0x01;
-const REQ_GET_FIRMWARE_STATUS: u8 = 0x02;
-const REQ_GET_FIRMWARE_VERSION: u8 = 0x03;
 const REQ_GET_DBG_MSG: u8 = 0x10;
 const REQ_GET_WR_REG: u8 = 0x11;
 const REQ_GET_RD_REG: u8 = 0x12;
 
 // OUT Requests
-const REQ_SET_ERASE_FLASH: u8 = 0x10;
-const REQ_SET_UPDATE_DATA: u8 = 0x11;
-const REQ_SET_FW_INFO_1: u8 = 0x12;
-const REQ_SET_FW_INFO_2: u8 = 0x13;
-const REQ_SET_FW_TO_BLDR: u8 = 0x20;
 const REQ_SET_DBG_MSG: u8 = 0x22;
 
 // --- USB 常量定义 ---
-const DESC_TYPE_STRING: u16 = 0x03;
-const DESC_TYPE_BOS: u16 = 0x0F;
-const DESC_TYPE_DEVICE_CAPABILITY: u8 = 0x10;
-const CAP_TYPE_BILLBOARD: u8 = 0x0D;
-
-const REQ_GET_DESCRIPTOR: u8 = 0x06;
-
-const READ_BUFFER_SIZE: u16 = 64;
+const READ_BUFFER_SIZE: u16 = 8;
 
 // ================= CLI 结构定义 =================
 
@@ -171,11 +155,14 @@ async fn run_log_console(interface: &nusb::Interface) -> io::Result<()> {
                         let text = String::from_utf8_lossy(valid_bytes);
                         print!("{}", text);
                         let _ = io::stdout().flush();
+                    } else {
+                        smol::future::yield_now().await
                     }
-                },
-                Err(_) => { smol::Timer::after(Duration::from_secs(1)).await; }
+                }
+                Err(_) => {
+                    smol::Timer::after(Duration::from_secs(1)).await;
+                }
             }
-            smol::Timer::after(Duration::from_millis(1)).await;
         }
     });
 
@@ -191,15 +178,15 @@ async fn run_log_console(interface: &nusb::Interface) -> io::Result<()> {
             Ok(0) => break, // EOF
             Ok(_) => {
                 let cmd_bytes = input_line.as_bytes();
-				let cmd_bytes = if cmd_bytes.ends_with(&[b'\n']) {
-					&cmd_bytes[..cmd_bytes.len() - 1]
-				} else {
-					cmd_bytes
-				};
+                let cmd_bytes = if cmd_bytes.ends_with(&[b'\n']) {
+                    &cmd_bytes[..cmd_bytes.len() - 1]
+                } else {
+                    cmd_bytes
+                };
 
                 // 发送给下位机 (复用 0x22，带数据)
                 match req_send_console_cmd(interface, cmd_bytes).await {
-                    Ok(_) => {}, // 发送成功
+                    Ok(_) => {} // 发送成功
                     Err(e) => eprintln!("\n[CMD ERROR] 发送失败: {}", e),
                 }
             }
@@ -331,7 +318,11 @@ async fn req_send_console_cmd(interface: &nusb::Interface, data: &[u8]) -> io::R
         index: 0,
         data: data, // 发送字符串字节
     };
-    interface.control_out(req, Duration::from_millis(200)).await.map(|_| ()).map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+    interface
+        .control_out(req, Duration::from_millis(200))
+        .await
+        .map(|_| ())
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
 }
 
 // [OUT] 0x22: 初始化日志
@@ -345,7 +336,11 @@ async fn req_set_dbg_msg_init(interface: &nusb::Interface) -> io::Result<()> {
         index: 0,
         data: &[], // 空数据
     };
-    interface.control_out(req, Duration::from_millis(200)).await.map(|_| ()).map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+    interface
+        .control_out(req, Duration::from_millis(200))
+        .await
+        .map(|_| ())
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
 }
 
 // [IN] 0x12: 读寄存器
