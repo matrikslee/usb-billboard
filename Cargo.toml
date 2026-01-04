@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 byteorder = "1.5.0"
 clap = { version = "4.5.54", features = ["derive"] }
+ctrlc = "3.5.1"
 nusb = { version = "0.2.1", features = ["smol"] }
 smol = "2.0.2"
 

@@ -1,8 +1,5 @@
 use clap::{Parser, Subcommand};
-use nusb::{
-    self, MaybeFuture,
-    transfer::{ControlIn, ControlOut, ControlType, Recipient},
-};
+use nusb::transfer::{ControlIn, ControlOut, ControlType, Recipient};
 use std::io::{self, Write};
 use std::time::Duration;
 
@@ -11,7 +8,7 @@ use std::time::Duration;
 const REQ_GET_HARDWARE_STATUS: u8 = 0x01;
 const REQ_GET_FIRMWARE_STATUS: u8 = 0x02;
 const REQ_GET_FIRMWARE_VERSION: u8 = 0x03;
-const REQ_GET_DBG_MSG: u8 = 0x10; // <--- 本次目标
+const REQ_GET_DBG_MSG: u8 = 0x10;
 const REQ_GET_WR_REG: u8 = 0x11;
 const REQ_GET_RD_REG: u8 = 0x12;
 
@@ -55,6 +52,9 @@ struct Cli {
 enum Commands {
     /// 读取实时调试日志
     Log,
+
+    /// 进入寄存器交互模式 (支持 r/w 指令)
+    Reg,
     // 可以在这里扩展其他子命令，例如：
     // Info { ... },
     // Reset,
@@ -62,12 +62,30 @@ enum Commands {
 
 /// 辅助函数：解析 16 进制字符串 (支持 "0x1234" 或 "1234")
 fn parse_hex_u16(s: &str) -> Result<u16, String> {
-    let s = s.trim().to_lowercase();
-    let s = s.strip_prefix("0x").unwrap_or(&s);
-    u16::from_str_radix(s, 16).map_err(|e: std::num::ParseIntError| e.to_string())
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("输入为空".to_string());
+    }
+    // 移除可能存在的 0x 或 0X 前缀
+    let clean_s = if s.to_lowercase().starts_with("0x") {
+        &s[2..]
+    } else {
+        s
+    };
+
+    // 强制使用基数 16 进行解析
+    u16::from_str_radix(clean_s, 16)
+        .map_err(|e: std::num::ParseIntError| format!("无法解析为十六进制数 '{}': {}", s, e))
 }
 
 fn main() {
+    // 捕获 Ctrl-C 以便优雅退出 REPL
+    ctrlc::set_handler(move || {
+        println!("\nExiting...");
+        std::process::exit(0);
+    })
+    .ok();
+
     // 使用 smol::block_on 启动异步世界
     smol::block_on(async_main());
 }
@@ -75,19 +93,31 @@ fn main() {
 async fn async_main() {
     let cli = Cli::parse();
 
-    println!("目标设备: VID=0x{:04X}, PID=0x{:04X}", cli.vid, cli.pid);
-
-    match cli.command {
-        Commands::Log => {
-            if let Err(e) = run_read_log(cli.vid, cli.pid).await {
-                eprintln!("执行出错: {}", e);
-                std::process::exit(1);
-            }
+    // 统一查找和打开设备逻辑
+    let interface = match find_and_open_device(cli.vid, cli.pid).await {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("错误: {}", e);
+            std::process::exit(1);
         }
+    };
+
+    // 根据子命令分发
+    let result = match cli.command {
+        Commands::Log => run_read_log(&interface).await,
+        Commands::Reg => run_reg_shell(&interface).await, // 进入交互模式
+    };
+
+    if let Err(e) = result {
+        eprintln!("执行失败: {}", e);
+        std::process::exit(1);
     }
 }
 
-async fn run_read_log(vid: u16, pid: u16) -> std::io::Result<()> {
+// ================= 设备连接辅助 =================
+async fn find_and_open_device(vid: u16, pid: u16) -> io::Result<nusb::Interface> {
+    println!("正在连接设备 VID:0x{:04X} PID:0x{:04X}...", vid, pid);
+
     // 1. 查找设备
     let device_info = nusb::list_devices()
         .await
@@ -95,38 +125,33 @@ async fn run_read_log(vid: u16, pid: u16) -> std::io::Result<()> {
         .find(|d| d.vendor_id() == vid && d.product_id() == pid)
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "未找到指定的 USB 设备"))?;
 
-    println!(
-        "找到设备: {}",
-        device_info.product_string().unwrap_or("未知设备")
-    );
-
     // 2. 打开设备
     let device = device_info
         .open()
         .await
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-
-    // Windows/WinUSB 必须先认领一个接口才能发送控制传输
-    // 通常我们认领接口 0 即可
-    println!("正在认领接口 0 以初始化 USB...");
     let interface = device
         .claim_interface(0)
         .await
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
-    // 3. 发送初始化命令 (SET_DBG_MSG)
+    Ok(interface)
+}
+
+// ================= 业务逻辑实现 =================
+
+// 1. 读取日志
+async fn run_read_log(interface: &nusb::Interface) -> io::Result<()> {
     println!("发送初始化请求 (SET_DBG_MSG)...");
-    if let Err(e) = set_dbg_msg(&interface).await {
-        eprintln!("初始化失败: {}", e);
-        // 根据具体情况，失败了是否还要继续？这里选择继续尝试读取
+    if let Err(e) = req_set_dbg_msg(interface).await {
+        eprintln!("警告: 初始化失败 ({})，尝试直接读取...", e);
     } else {
-        println!("初始化成功，开始监听日志...");
+        println!("初始化成功！");
     }
 
-    // 4. 循环读取调试信息 (GET_DBG_MSG)
-    println!("\n--- 开始打印调试日志 按Ctrl-C退出 ---");
+    println!("--- 开始监听日志 (按 Ctrl+C 退出) ---");
     loop {
-        match get_dbg_msg(&interface).await {
+        match req_get_dbg_msg(interface).await {
             Ok(data) => {
                 let valid_len = data.iter().position(|&x| x == 0).unwrap_or(data.len());
                 // 获取有效切片 (Slice)
@@ -138,62 +163,196 @@ async fn run_read_log(vid: u16, pid: u16) -> std::io::Result<()> {
                     let _ = io::stdout().flush();
                 }
             }
-            Err(e) => {
-                // 只有真正的 USB 通信错误才报错，而不是数据内容错误
-                eprintln!("通信读取出错: {}", e);
+            Err(_) => {
                 smol::Timer::after(Duration::from_secs(1)).await;
             }
         }
-        // 防止请求过于频繁占用 CPU/USB 带宽
-        smol::Timer::after(Duration::from_millis(10)).await;
+        smol::Timer::after(Duration::from_millis(1)).await;
     }
-    // 因为是死循环，这里实际上不可达，但为了满足签名需要一个 Ok(())
-    #[allow(unreachable_code)]
+}
+
+// 2. 寄存器交互 Shell
+async fn run_reg_shell(interface: &nusb::Interface) -> io::Result<()> {
+    println!("--- 寄存器交互模式 ---");
+    println!("用法:");
+    println!("  r <addr> <offset>          读取寄存器 (Addr + Offset)");
+    println!("  w <addr> <offset> <value>  写入寄存器 (Addr + Offset)");
+    println!("  exit / quit                退出");
+    println!("------------------------");
+
+    let stdin = io::stdin();
+    let mut input_buf = String::new();
+
+    loop {
+        print!("> ");
+        io::stdout().flush()?;
+        input_buf.clear();
+
+        // 读取一行输入
+        if stdin.read_line(&mut input_buf).is_err() {
+            break;
+        }
+
+        let line = input_buf.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        match parts.as_slice() {
+            // 解析读指令
+            ["r", addr_str, offset_str] => {
+                let addr = match parse_hex_u16(addr_str) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("Read Err: {}", e);
+                        continue;
+                    }
+                };
+                let offset = match parse_hex_u16(offset_str) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("Read Err: {}", e);
+                        continue;
+                    }
+                };
+
+                match req_read_reg(interface, addr, offset).await {
+                    Ok(data) => {
+                        print!("[READ {:02X}::{:04X}] ", addr, offset);
+                        for b in data {
+                            print!("0x{:02X} ", b);
+                        }
+                        println!();
+                    }
+                    Err(e) => eprintln!("Read Error: {}", e),
+                }
+            }
+            // 解析写指令
+            ["w", addr_str, offset_str, val_str] => {
+                let addr = match parse_hex_u16(addr_str) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("{}", e);
+                        continue;
+                    }
+                };
+                let offset = match parse_hex_u16(offset_str) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("Write Error: {}", e);
+                        continue;
+                    }
+                };
+                let val = match parse_hex_u16(val_str) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("Write Error: {}", e);
+                        continue;
+                    }
+                };
+
+                // Value 只取低 8 位 (因为下位机是 & 0x00FF)
+                // Addr 只取低 8 位 (因为下位机是 & 0xFF00 >> 8，虽然我们传u16，但会被截断)
+                match req_write_reg(interface, addr, offset, val as u8).await {
+                    Ok(_) => {
+                        println!(
+                            "[WRITE 0x{:02X}::{:04X} <= 0x{:02X}] Done",
+                            addr, offset, val
+                        );
+                    }
+                    Err(e) => eprintln!("Write Error: {}", e),
+                }
+            }
+            ["exit"] | ["quit"] | ["q"] => {
+                println!("Bye!");
+                break;
+            }
+            _ => {
+                eprintln!("格式错误: r <addr> <offset> 或 w <addr> <offset> <value>");
+            }
+        }
+    }
     Ok(())
 }
 
-// --- 实现 OUT 请求 (主机 -> 下位机) ---
-async fn set_dbg_msg(interface: &nusb::Interface) -> std::io::Result<()> {
+// ================= 底层 USB 请求封装 =================
+
+// [IN] 0x12: 读寄存器
+// C代码: bus_map(setup->wValue, setup->wIndex)
+// 映射: wValue = Addr, wIndex = Offset
+// 返回: PACKET_LEN (8 bytes)
+async fn req_read_reg(interface: &nusb::Interface, addr: u16, offset: u16) -> io::Result<Vec<u8>> {
+    let req = ControlIn {
+        control_type: ControlType::Vendor,
+        recipient: Recipient::Device,
+        request: REQ_GET_RD_REG, // 0x12
+        value: addr,
+        index: offset,
+        length: 8,
+    };
+    println!("addr{addr}, offset{offset}");
+    interface
+        .control_in(req, Duration::from_millis(200))
+        .await
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+}
+
+// [IN] 0x11: 写寄存器
+// C代码: write_reg((setup->wValue & 0xFF00) >> 8, setup->wIndex, setup->wValue & 0x00FF)
+// 映射: wValue High=Addr, wValue Low=Value, wIndex=Offset
+async fn req_write_reg(
+    interface: &nusb::Interface,
+    addr: u16,
+    offset: u16,
+    val: u8,
+) -> io::Result<Vec<u8>> {
+    // 构造 wValue: 高8位是地址，低8位是值
+    let w_value = ((addr & 0xFF) << 8) | (val as u16);
+    println!("w_value{w_value}, offset{offset}");
+
+    let req = ControlIn {
+        control_type: ControlType::Vendor,
+        recipient: Recipient::Device,
+        request: REQ_GET_WR_REG, // 0x11
+        value: w_value,          // 组合 Addr 和 Value
+        index: offset,           // Offset
+        length: 8,
+    };
+    interface
+        .control_in(req, Duration::from_millis(200))
+        .await
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+}
+
+// [OUT] 0x22: 开启日志
+async fn req_set_dbg_msg(interface: &nusb::Interface) -> io::Result<()> {
     let req = ControlOut {
         control_type: ControlType::Vendor,
-        recipient: Recipient::Interface, // 必须是 Interface 以匹配 WinUSB 句柄
-        request: REQ_SET_DBG_MSG,        // 0x22
-        value: 0,                        // wValue 通常为0，除非协议指定需要传参
-        index: 0,                        // wIndex 接口号
-        data: &[],                       // data: 空数据 (如果协议需要传参，在这里填 &[0x01] 等)
+        recipient: Recipient::Device,
+        request: REQ_SET_DBG_MSG,
+        value: 0,
+        index: 0,
+        data: &[],
     };
-
-    // 发送请求，忽略返回值(写入字节数)
     interface
         .control_out(req, Duration::from_millis(200))
-        .wait()
-        .unwrap();
-    Ok(())
+        .await
+        .map(|_| ())
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
 }
 
-// --- 实现 IN 请求 (下位机 -> 主机) ---
-async fn get_dbg_msg(interface: &nusb::Interface) -> std::io::Result<Vec<u8>> {
-    // 构造控制传输参数
-    // bmRequestType: Dir=IN(0x80) | Type=Vendor(0x40) | Recipient=Device(0x00) => 0xC0
+// [IN] 0x10: 获取日志流
+async fn req_get_dbg_msg(interface: &nusb::Interface) -> io::Result<Vec<u8>> {
     let req = ControlIn {
-        control_type: ControlType::Vendor, // 关键：必须是 Vendor，不是 Standard
-        recipient: Recipient::Interface, // 通常是对整个设备的请求。如果不行，尝试 Recipient::Interface
-        request: REQ_GET_DBG_MSG,        // 0x10
-        value: 0,                        // wValue 通常为0，除非协议另有规定
-        index: 0,                        // wIndex 通常为0
-        length: READ_BUFFER_SIZE,        // 每次获取 64 字节
+        control_type: ControlType::Vendor,
+        recipient: Recipient::Device,
+        request: REQ_GET_DBG_MSG,
+        value: 0,
+        index: 0,
+        length: READ_BUFFER_SIZE,
     };
-
-    // 发送请求
-    let data = interface
+    interface
         .control_in(req, Duration::from_millis(200))
-        .wait()
-        .unwrap();
-
-    // 检查长度（可选）
-    if data.len() != 8 {
-        println!("警告: 预期收到 8 字节，实际收到 {} 字节", data.len());
-    }
-
-    Ok(data)
+        .await
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
 }
