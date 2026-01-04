@@ -250,7 +250,7 @@ async fn run_reg_shell(interface: &nusb::Interface) -> io::Result<()> {
                     Ok(data) => {
                         print!("[READ {:02X}::{:04X}] ", addr, offset);
                         for b in data {
-                            print!("0x{:02X} ", b);
+                            print!("{:02X} ", b);
                         }
                         println!();
                     }
@@ -286,7 +286,7 @@ async fn run_reg_shell(interface: &nusb::Interface) -> io::Result<()> {
                 match req_write_reg(interface, addr, offset, val as u8).await {
                     Ok(_) => {
                         println!(
-                            "[WRITE 0x{:02X}::{:04X} <= 0x{:02X}] Done",
+                            "[WRITE {:02X}::{:04X} <= {:02X}] Done",
                             addr, offset, val
                         );
                     }
