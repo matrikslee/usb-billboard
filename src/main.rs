@@ -1,7 +1,9 @@
+
+use std::time::Duration;
+use std::io::{self, Write};
+use smol::io::AsyncBufReadExt;
 use clap::{Parser, Subcommand};
 use nusb::transfer::{ControlIn, ControlOut, ControlType, Recipient};
-use std::io::{self, Write};
-use std::time::Duration;
 
 // --- 厂商请求定义 (对应 C 代码宏) ---
 // IN Requests
@@ -104,7 +106,7 @@ async fn async_main() {
 
     // 根据子命令分发
     let result = match cli.command {
-        Commands::Log => run_read_log(&interface).await,
+        Commands::Log => run_log_console(&interface).await,
         Commands::Reg => run_reg_shell(&interface).await, // 进入交互模式
     };
 
@@ -140,35 +142,76 @@ async fn find_and_open_device(vid: u16, pid: u16) -> io::Result<nusb::Interface>
 
 // ================= 业务逻辑实现 =================
 
-// 1. 读取日志
-async fn run_read_log(interface: &nusb::Interface) -> io::Result<()> {
-    println!("发送初始化请求 (SET_DBG_MSG)...");
-    if let Err(e) = req_set_dbg_msg(interface).await {
-        eprintln!("警告: 初始化失败 ({})，尝试直接读取...", e);
+// 1. 日志 + Console 输入模式
+async fn run_log_console(interface: &nusb::Interface) -> io::Result<()> {
+    println!("发送初始化请求 (SET_DBG_MSG, Len=0)...");
+    // 初始化调用，payload 为空
+    if let Err(e) = req_set_dbg_msg_init(interface).await {
+        eprintln!("警告: 初始化失败 ({})，尝试直接进入模式...", e);
     } else {
         println!("初始化成功！");
     }
 
-    println!("--- 开始监听日志 (按 Ctrl+C 退出) ---");
+    println!("--- 进入 Console 模式 ---");
+    println!(" [提示] 直接输入命令并回车发送，按 Ctrl+C 退出");
+    println!("---------------------------------------");
+
+    let log_interface = interface.clone();
+
+    // 任务 A: 后台接收日志
+    let logger_task = smol::spawn(async move {
+        loop {
+            match req_get_dbg_msg(&log_interface).await {
+                Ok(data) => {
+                    let valid_len = data.iter().position(|&x| x == 0).unwrap_or(data.len());
+                    // 获取有效切片 (Slice)
+                    let valid_bytes = &data[0..valid_len];
+                    // 只有当有效字节不为空时才打印
+                    if !valid_bytes.is_empty() {
+                        let text = String::from_utf8_lossy(valid_bytes);
+                        print!("{}", text);
+                        let _ = io::stdout().flush();
+                    }
+                },
+                Err(_) => { smol::Timer::after(Duration::from_secs(1)).await; }
+            }
+            smol::Timer::after(Duration::from_millis(1)).await;
+        }
+    });
+
+    // 任务 B: 前台读取键盘输入
+    let stdin = smol::Unblock::new(std::io::stdin());
+    let mut reader = smol::io::BufReader::new(stdin);
+    let mut input_line = String::new();
+
     loop {
-        match req_get_dbg_msg(interface).await {
-            Ok(data) => {
-                let valid_len = data.iter().position(|&x| x == 0).unwrap_or(data.len());
-                // 获取有效切片 (Slice)
-                let valid_bytes = &data[0..valid_len];
-                // 只有当有效字节不为空时才打印
-                if !valid_bytes.is_empty() {
-                    let text = String::from_utf8_lossy(valid_bytes);
-                    print!("{}", text);
-                    let _ = io::stdout().flush();
+        input_line.clear();
+        // 异步读取一行
+        match reader.read_line(&mut input_line).await {
+            Ok(0) => break, // EOF
+            Ok(_) => {
+                let cmd_bytes = input_line.as_bytes();
+				let cmd_bytes = if cmd_bytes.ends_with(&[b'\n']) {
+					&cmd_bytes[..cmd_bytes.len() - 1]
+				} else {
+					cmd_bytes
+				};
+
+                // 发送给下位机 (复用 0x22，带数据)
+                match req_send_console_cmd(interface, cmd_bytes).await {
+                    Ok(_) => {}, // 发送成功
+                    Err(e) => eprintln!("\n[CMD ERROR] 发送失败: {}", e),
                 }
             }
-            Err(_) => {
-                smol::Timer::after(Duration::from_secs(1)).await;
+            Err(e) => {
+                eprintln!("Stdin Error: {}", e);
+                break;
             }
         }
-        smol::Timer::after(Duration::from_millis(1)).await;
     }
+
+    logger_task.cancel().await;
+    Ok(())
 }
 
 // 2. 寄存器交互 Shell
@@ -277,6 +320,34 @@ async fn run_reg_shell(interface: &nusb::Interface) -> io::Result<()> {
 
 // ================= 底层 USB 请求封装 =================
 
+// [OUT] 0x22: 发送 Console 命令 (复用 SET_DBG_MSG)
+// 区别：Payload 不为空
+async fn req_send_console_cmd(interface: &nusb::Interface, data: &[u8]) -> io::Result<()> {
+    let req = ControlOut {
+        control_type: ControlType::Vendor,
+        recipient: Recipient::Interface,
+        request: REQ_SET_DBG_MSG, // 0x22
+        value: 0,
+        index: 0,
+        data: data, // 发送字符串字节
+    };
+    interface.control_out(req, Duration::from_millis(200)).await.map(|_| ()).map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+}
+
+// [OUT] 0x22: 初始化日志
+// 区别：Payload 为空
+async fn req_set_dbg_msg_init(interface: &nusb::Interface) -> io::Result<()> {
+    let req = ControlOut {
+        control_type: ControlType::Vendor,
+        recipient: Recipient::Interface,
+        request: REQ_SET_DBG_MSG, // 0x22
+        value: 0,
+        index: 0,
+        data: &[], // 空数据
+    };
+    interface.control_out(req, Duration::from_millis(200)).await.map(|_| ()).map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+}
+
 // [IN] 0x12: 读寄存器
 // C代码: bus_map(setup->wValue, setup->wIndex)
 // 映射: wValue = Addr, wIndex = Offset
@@ -316,28 +387,11 @@ async fn req_write_reg(
         request: REQ_GET_WR_REG, // 0x11
         value: w_value,          // 组合 Addr 和 Value
         index: offset,           // Offset
-        length: 8,
+        length: 0,
     };
     interface
         .control_in(req, Duration::from_millis(200))
         .await
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
-}
-
-// [OUT] 0x22: 开启日志
-async fn req_set_dbg_msg(interface: &nusb::Interface) -> io::Result<()> {
-    let req = ControlOut {
-        control_type: ControlType::Vendor,
-        recipient: Recipient::Device,
-        request: REQ_SET_DBG_MSG,
-        value: 0,
-        index: 0,
-        data: &[],
-    };
-    interface
-        .control_out(req, Duration::from_millis(200))
-        .await
-        .map(|_| ())
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
 }
 

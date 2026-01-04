@@ -7,17 +7,17 @@
 
 **USB Billboard Debug Tool** 是一个高性能、轻量级的 USB 上位机实用工具。它通过 USB Billboard Class 设备的 **Vendor-Specific（厂商自定义）** 接口，提供实时日志监控和底层寄存器读写功能。
 
-本项目基于 **Rust 2024 Edition** 和极简异步运行时 **`smol`** 构建。
+本项目基于 **Rust 2024 Edition** 和极简异步运行时 **`smol`** 构建，采用 **并发任务架构** 实现收发分离。
 
 ## ✨ 功能特性
 
-*   **实时日志流 (Log Streaming)**：
-    *   使用 `GET_DBG_MSG` (0x10) 请求。
-    *   支持下位机环形缓冲区，实现弹性读取，不丢字、不刷屏。
-*   **交互式寄存器调试 (Register REPL)**：
-    *   提供类似 Shell 的交互环境，支持 `r` (read) 和 `w` (write) 指令。
+*   **双向交互控制台 (Interactive Console)**：
+    *   **实时日志**：通过 `GET_DBG_MSG` (0x10) 请求，配合环形缓冲区与短包机制，实现不丢字、低延迟的日志流监控。
+    *   **命令发送**：复用 `SET_DBG_MSG` (0x22) 请求，支持从标准输入（Stdin）发送字符串命令到下位机，实现类似 Shell 的交互体验。
+    *   **并发架构**：后台任务接收日志，前台任务处理键盘输入，互不阻塞。
+*   **寄存器调试 (Register REPL)**：
+    *   提供独立的交互环境，支持 `r` (read) 和 `w` (write) 指令。
     *   智能参数解析：支持十六进制自动识别（如 `10` 等同于 `0x10`）。
-*   **设备初始化**：发送 `SET_DBG_MSG` (0x22) 激活调试模式。
 *   **灵活性**：运行时指定 VID/PID，适配不同固件版本。
 
 ## 🛠️ 环境要求
@@ -56,7 +56,11 @@ cargo build --release
 ```bash
 usb-billboard log
 ```
-*程序会自动发送初始化命令，然后进入监听模式。按 `Ctrl+C` 退出。*
+* **日志显示：**程序会自动初始化并持续打印下位机输出的日志。
+
+* **发送命令：**直接在终端输入字符串并回车，程序会将整行内容发送给下位机。
+
+* **退出：**按 Ctrl+C。
 
 ### 2. 寄存器交互模式 (REPL)
 进入命令行交互环境，进行寄存器读写。
@@ -65,7 +69,7 @@ usb-billboard reg
 ```
 
 **交互命令示例：**
-> **注意**：所有数值参数均默认视为十六进制（无需加 `0x` 前缀）。
+> **注意**：所有数值参数均默认视为十六进制。
 
 *   **读取寄存器**：`r <addr> <offset>`
     ```text
@@ -89,20 +93,33 @@ usb-billboard.exe --vid 1234 --pid abcd log
 
 本工具基于 USB Control Transfer 实现。
 
-| 功能 | 方向 | Req ID | 接收者 (Recipient) | wValue | wIndex | wLength |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **开启日志** | OUT | `0x22` | Interface/Device | 0 | Interface (0) | 0 |
-| **获取日志** | IN | `0x10` | Interface/Device | 0 | Interface (0) | 64 |
-| **读寄存器** | IN | `0x12` | **Device*** | `Addr` | `Offset` | 8 |
-| **写寄存器** | IN** | `0x11` | **Device*** | `(Addr<<8) \| Val` | `Offset` | 8 |
+| 功能 | 方向 | Req ID | 接收者 (Recipient) | wValue | wIndex | wLength | 数据(Data) |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **开启日志** | OUT | `0x22` | Interface/Device | 0 | Interface (0) | 0 | (Empty) |
+| **发送命令** | OUT | `0x22` | Interface/Device | 0 | Interface (0) | * | Cmd String Bytes |
+| **获取日志** | IN | `0x10` | Interface/Device | 0 | Interface (0) | 64 | Log String Bytes |
+| **读寄存器** | IN | `0x12` | **Device*** | `Addr` | `Offset` | 8 | Reg Data |
+| **写寄存器** | IN** | `0x11` | **Device*** | `(Addr<<8) \| Val` | `Offset` | 8 | (Empty) |
 
-### * 说明：WinUSB 限制
-在 Windows WinUSB 驱动中，如果 Request Recipient 是 `Interface`，驱动强制要求 `wIndex` 的低 8 位必须等于接口号（0）。这导致无法通过 `wIndex` 传递任意的 Register Offset。
-*   **解决方案**：上位机将读写寄存器的 Recipient 修改为 **`Device`**。
-*   **原理**：Windows 不会校验 Device 请求的 `wIndex`；而下位机固件通常只校验 Request ID，忽略 Recipient 类型，从而成功绕过限制。
+### 协议说明
+1.  **Request `0x22` 复用**：下位机通过 `wLength` 区分功能。长度为 0 表示开启日志功能；长度 > 0 表示接收 Console 命令字符串。
+2.  **Request `0x11` 写寄存器**：尽管是写操作，但定义为 IN 请求，数值通过 `wValue` 传递，下位机返回状态码。
+3.  **WinUSB 限制规避 (*)**：
+    *   在 Windows 下，`Recipient::Interface` 请求强制要求 `wIndex` 低字节为接口号。
+    *   为了支持任意 Offset 的寄存器访问，寄存器相关指令将 Recipient 修改为 **`Device`**，从而绕过驱动检查。
 
-### ** 写寄存器特殊说明
-虽然是写操作，但协议定义为 `REQ_GET_WR_REG` (0x11)，这是一个 IN 请求。要写入的值通过 `wValue` 的低 8 位传递，下位机执行写入后返回状态数据。
+## 🏗️ 核心技术
+
+*   **Smol**: 使用 `smol::spawn` 运行后台日志任务，使用 `smol::Unblock` 实现 Stdin 的异步非阻塞读取。
+*   **Nusb**: 纯 Rust USB 栈，通过 `Interface` 和 `Device` Recipient 的灵活切换解决驱动兼容性问题。
+*   **Optimization**:
+    ```toml
+    [profile.release]
+    strip = true
+    lto = true
+    codegen-units = 1
+    panic = "abort"
+    ```
 
 ## 📄 License
 
