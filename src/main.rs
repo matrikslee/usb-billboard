@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 use nusb::transfer::{ControlIn, ControlOut, ControlType, Recipient};
+use smol::channel::{Receiver, unbounded};
 use smol::io::AsyncBufReadExt;
 use std::io::{self, Write};
 use std::sync::Arc;
@@ -73,14 +74,33 @@ fn main() {
 async fn async_main() {
     let cli = Cli::parse();
 
+    let (stdin_tx, stdin_rx) = unbounded::<String>();
+
+    // 启动一个脱离生命周期的后台任务，专门读键盘
+    smol::spawn(async move {
+        let stdin = smol::Unblock::new(std::io::stdin());
+        let mut reader = smol::io::BufReader::new(stdin);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            // 这里会一直阻塞等待输入
+            if reader.read_line(&mut line).await.is_ok() {
+                // 读取成功，发送给主逻辑
+                if stdin_tx.send(line.clone()).await.is_err() {
+                    break; // 主程序退出了
+                }
+            }
+        }
+    })
+    .detach(); // detach 表示这个任务在后台一直运行
+
     // 外层循环：支持断线重连
     loop {
         // 1. 尝试连接设备
         let interface = match find_and_open_device(cli.vid, cli.pid).await {
             Ok(i) => i,
-            Err(e) => {
-                eprintln!("连接失败: {}", e);
-                wait_for_retry().await;
+            Err(_) => {
+                smol::Timer::after(Duration::from_millis(1000)).await;
                 continue;
             }
         };
@@ -88,7 +108,7 @@ async fn async_main() {
         // 2. 根据子命令执行业务逻辑
         // 如果函数返回 Err，说明发生了致命错误（如设备断开），则进入下一次重连循环
         let result = match cli.command {
-            Commands::Log => run_log_console(&interface).await,
+            Commands::Log => run_log_console(&interface, stdin_rx.clone()).await,
             Commands::Reg => run_reg_shell(&interface).await,
         };
 
@@ -99,28 +119,15 @@ async fn async_main() {
                 println!("会话结束。");
                 break;
             }
-            Err(e) => {
-                eprintln!("\n[错误] 设备连接中断或发生错误: {}", e);
-                // 释放 interface 资源（rust drop机制自动处理），准备重连
-                wait_for_retry().await;
+            Err(_) => {
+                eprintln!("\n设备连接中断或发生错误。等待重连...");
             }
         }
     }
 }
 
-/// 辅助：等待用户按回车重试
-async fn wait_for_retry() {
-    eprintln!("按 Enter 键尝试重新连接...");
-    let stdin = smol::Unblock::new(std::io::stdin());
-    let mut reader = smol::io::BufReader::new(stdin);
-    let mut line = String::new();
-    let _ = reader.read_line(&mut line).await;
-}
-
 // ================= 设备连接辅助 =================
 async fn find_and_open_device(vid: u16, pid: u16) -> io::Result<nusb::Interface> {
-    println!("正在搜索设备 VID:0x{:04X} PID:0x{:04X}...", vid, pid);
-
     let device_info = nusb::list_devices()
         .await
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
@@ -144,7 +151,10 @@ async fn find_and_open_device(vid: u16, pid: u16) -> io::Result<nusb::Interface>
 // ================= 业务逻辑实现 =================
 
 // 1. 日志 + Console 输入模式
-async fn run_log_console(interface: &nusb::Interface) -> io::Result<()> {
+async fn run_log_console(
+    interface: &nusb::Interface,
+    stdin_receiver: Receiver<String>,
+) -> io::Result<()> {
     // 初始化调用
     if let Err(e) = req_set_dbg_msg_init(interface).await {
         eprintln!("警告: 初始化失败 ({})", e);
@@ -186,14 +196,12 @@ async fn run_log_console(interface: &nusb::Interface) -> io::Result<()> {
                                     log_suppress.store(false, Ordering::SeqCst);
                                     // 注意：这个 \n 本身也是回显的一部分，所以也不打印
                                 }
-                                // 更新状态，并丢弃当前字符 b
-                                last_char_was_cr = b == b'\r';
                             } else {
                                 // 非静默状态，正常收集字符
                                 output_buffer.push(b);
-                                // 同时也更新 CR 状态（虽然非静默时不需要检测，但保持状态一致性）
-                                last_char_was_cr = b == b'\r';
                             }
+                            // 更新状态，并丢弃当前字符 b
+                            last_char_was_cr = b == b'\r';
                         }
 
                         // 批量打印有效字符
@@ -219,15 +227,9 @@ async fn run_log_console(interface: &nusb::Interface) -> io::Result<()> {
     // 任务 B: 键盘输入
     let input_suppress = suppress_echo.clone();
     let input_task = async move {
-        let stdin = smol::Unblock::new(std::io::stdin());
-        let mut reader = smol::io::BufReader::new(stdin);
-        let mut input_line = String::new();
-
         loop {
-            input_line.clear();
-            match reader.read_line(&mut input_line).await {
-                Ok(0) => return Ok(()), // EOF
-                Ok(_) => {
+            match stdin_receiver.recv().await {
+                Ok(input_line) => {
                     let cmd_clean = input_line.trim().to_string();
 
                     let mut cmd_to_send = cmd_clean;
@@ -243,7 +245,7 @@ async fn run_log_console(interface: &nusb::Interface) -> io::Result<()> {
                         return Err(e);
                     }
                 }
-                Err(e) => return Err(e),
+                Err(_) => return Ok(()),
             }
         }
     };
