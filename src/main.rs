@@ -2,6 +2,8 @@ use clap::{Parser, Subcommand};
 use nusb::transfer::{ControlIn, ControlOut, ControlType, Recipient};
 use smol::io::AsyncBufReadExt;
 use std::io::{self, Write};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 // --- 厂商请求定义 ---
@@ -34,93 +36,108 @@ struct Cli {
     command: Commands,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone, Copy)]
 enum Commands {
     /// 读取实时调试日志
     Log,
 
     /// 进入寄存器交互模式 (支持 r/w 指令)
     Reg,
-    // 可以在这里扩展其他子命令，例如：
-    // Info { ... },
-    // Reset,
 }
 
-/// 辅助函数：解析 16 进制字符串 (支持 "0x1234" 或 "1234")
+/// 辅助函数：解析 16 进制字符串
 fn parse_hex_u16(s: &str) -> Result<u16, String> {
     let s = s.trim();
     if s.is_empty() {
         return Err("输入为空".to_string());
     }
-    // 移除可能存在的 0x 或 0X 前缀
     let clean_s = if s.to_lowercase().starts_with("0x") {
         &s[2..]
     } else {
         s
     };
-
-    // 强制使用基数 16 进行解析
     u16::from_str_radix(clean_s, 16)
         .map_err(|e: std::num::ParseIntError| format!("无法解析为十六进制数 '{}': {}", s, e))
 }
 
 fn main() {
-    // 捕获 Ctrl-C 以便优雅退出 REPL
     ctrlc::set_handler(move || {
         println!("\nExiting...");
         std::process::exit(0);
     })
     .ok();
 
-    // 使用 smol::block_on 启动异步世界
     smol::block_on(async_main());
 }
 
 async fn async_main() {
     let cli = Cli::parse();
 
-    // 统一查找和打开设备逻辑
-    let interface = match find_and_open_device(cli.vid, cli.pid).await {
-        Ok(i) => i,
-        Err(e) => {
-            eprintln!("错误: {}", e);
-            std::process::exit(1);
+    // 外层循环：支持断线重连
+    loop {
+        // 1. 尝试连接设备
+        let interface = match find_and_open_device(cli.vid, cli.pid).await {
+            Ok(i) => i,
+            Err(e) => {
+                eprintln!("连接失败: {}", e);
+                wait_for_retry().await;
+                continue;
+            }
+        };
+
+        // 2. 根据子命令执行业务逻辑
+        // 如果函数返回 Err，说明发生了致命错误（如设备断开），则进入下一次重连循环
+        let result = match cli.command {
+            Commands::Log => run_log_console(&interface).await,
+            Commands::Reg => run_reg_shell(&interface).await,
+        };
+
+        // 3. 处理会话结束结果
+        match result {
+            Ok(_) => {
+                // 用户主动退出 (如输入 exit 或 Ctrl+C 的逻辑分支)
+                println!("会话结束。");
+                break;
+            }
+            Err(e) => {
+                eprintln!("\n[错误] 设备连接中断或发生错误: {}", e);
+                // 释放 interface 资源（rust drop机制自动处理），准备重连
+                wait_for_retry().await;
+            }
         }
-    };
-
-    // 根据子命令分发
-    let result = match cli.command {
-        Commands::Log => run_log_console(&interface).await,
-        Commands::Reg => run_reg_shell(&interface).await, // 进入交互模式
-    };
-
-    if let Err(e) = result {
-        eprintln!("执行失败: {}", e);
-        std::process::exit(1);
     }
+}
+
+/// 辅助：等待用户按回车重试
+async fn wait_for_retry() {
+    eprintln!("按 Enter 键尝试重新连接...");
+    let stdin = smol::Unblock::new(std::io::stdin());
+    let mut reader = smol::io::BufReader::new(stdin);
+    let mut line = String::new();
+    let _ = reader.read_line(&mut line).await;
 }
 
 // ================= 设备连接辅助 =================
 async fn find_and_open_device(vid: u16, pid: u16) -> io::Result<nusb::Interface> {
-    println!("正在连接设备 VID:0x{:04X} PID:0x{:04X}...", vid, pid);
+    println!("正在搜索设备 VID:0x{:04X} PID:0x{:04X}...", vid, pid);
 
-    // 1. 查找设备
     let device_info = nusb::list_devices()
         .await
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
         .find(|d| d.vendor_id() == vid && d.product_id() == pid)
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "未找到指定的 USB 设备"))?;
 
-    // 2. 打开设备
     let device = device_info
         .open()
         .await
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
     let interface = device
         .claim_interface(0)
         .await
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
+    println!("设备已连接！");
     Ok(interface)
 }
 
@@ -128,86 +145,118 @@ async fn find_and_open_device(vid: u16, pid: u16) -> io::Result<nusb::Interface>
 
 // 1. 日志 + Console 输入模式
 async fn run_log_console(interface: &nusb::Interface) -> io::Result<()> {
-    println!("发送初始化请求 (SET_DBG_MSG, Len=0)...");
-    // 初始化调用，payload 为空
+    // 初始化调用
     if let Err(e) = req_set_dbg_msg_init(interface).await {
-        eprintln!("警告: 初始化失败 ({})，尝试直接进入模式...", e);
-    } else {
-        println!("初始化成功！");
+        eprintln!("警告: 初始化失败 ({})", e);
     }
 
-    println!("--- 进入 Console 模式 ---");
-    println!(" [提示] 直接输入命令并回车发送，按 Ctrl+C 退出");
+    println!("--- 进入 Log Console 模式 ---");
+    println!(" [提示] 输入命令回车发送，按 Ctrl+C 退出");
     println!("---------------------------------------");
 
-    let log_interface = interface.clone();
+    // 用于回显去重的共享标志
+    // true: 表示刚发送了命令，正在等待下位机回显结束（收到 \r\n 之前不打印）
+    // false: 正常打印日志
+    let suppress_echo = Arc::new(AtomicBool::new(false));
 
-    // 任务 A: 后台接收日志
-    let logger_task = smol::spawn(async move {
+    // 任务 A: 日志读取
+    let log_interface = interface.clone();
+    let log_suppress = suppress_echo.clone();
+
+    let logger_task = async move {
+        // 记录上一个字符是否为 \r，用于跨包检测 \r\n
+        let mut last_char_was_cr = false;
+
         loop {
             match req_get_dbg_msg(&log_interface).await {
                 Ok(data) => {
                     let valid_len = data.iter().position(|&x| x == 0).unwrap_or(data.len());
-                    // 获取有效切片 (Slice)
                     let valid_bytes = &data[0..valid_len];
-                    // 只有当有效字节不为空时才打印
+
                     if !valid_bytes.is_empty() {
-                        let text = String::from_utf8_lossy(valid_bytes);
-                        print!("{}", text);
-                        let _ = io::stdout().flush();
+                        // 准备一个缓冲区存放需要打印的字符
+                        let mut output_buffer = Vec::new();
+
+                        for &b in valid_bytes {
+                            // 检查当前是否处于“静默回显”状态
+                            if log_suppress.load(Ordering::SeqCst) {
+                                // 处于静默状态，检测是否收到 \r\n 结束符
+                                if b == b'\n' && last_char_was_cr {
+                                    // 找到了 \r\n，回显结束，解除静默
+                                    log_suppress.store(false, Ordering::SeqCst);
+                                    // 注意：这个 \n 本身也是回显的一部分，所以也不打印
+                                }
+                                // 更新状态，并丢弃当前字符 b
+                                last_char_was_cr = b == b'\r';
+                            } else {
+                                // 非静默状态，正常收集字符
+                                output_buffer.push(b);
+                                // 同时也更新 CR 状态（虽然非静默时不需要检测，但保持状态一致性）
+                                last_char_was_cr = b == b'\r';
+                            }
+                        }
+
+                        // 批量打印有效字符
+                        if !output_buffer.is_empty() {
+                            print!("{}", String::from_utf8_lossy(&output_buffer));
+                            let _ = io::stdout().flush();
+                        }
                     } else {
-                        smol::future::yield_now().await
+                        smol::future::yield_now().await;
                     }
                 }
-                Err(_) => {
-                    smol::Timer::after(Duration::from_secs(1)).await;
+                Err(e) => {
+                    if e.kind() == io::ErrorKind::TimedOut {
+                        smol::Timer::after(Duration::from_millis(100)).await;
+                        continue;
+                    }
+                    return Err(e);
                 }
             }
         }
-    });
+    };
 
-    // 任务 B: 前台读取键盘输入
-    let stdin = smol::Unblock::new(std::io::stdin());
-    let mut reader = smol::io::BufReader::new(stdin);
-    let mut input_line = String::new();
+    // 任务 B: 键盘输入
+    let input_suppress = suppress_echo.clone();
+    let input_task = async move {
+        let stdin = smol::Unblock::new(std::io::stdin());
+        let mut reader = smol::io::BufReader::new(stdin);
+        let mut input_line = String::new();
 
-    loop {
-        input_line.clear();
-        // 异步读取一行
-        match reader.read_line(&mut input_line).await {
-            Ok(0) => break, // EOF
-            Ok(_) => {
-                let cmd_bytes = input_line.as_bytes();
-                let cmd_bytes = if cmd_bytes.ends_with(&[b'\n']) {
-                    &cmd_bytes[..cmd_bytes.len() - 1]
-                } else {
-                    cmd_bytes
-                };
+        loop {
+            input_line.clear();
+            match reader.read_line(&mut input_line).await {
+                Ok(0) => return Ok(()), // EOF
+                Ok(_) => {
+                    let cmd_clean = input_line.trim().to_string();
 
-                // 发送给下位机 (复用 0x22，带数据)
-                match req_send_console_cmd(interface, cmd_bytes).await {
-                    Ok(_) => {} // 发送成功
-                    Err(e) => eprintln!("\n[CMD ERROR] 发送失败: {}", e),
+                    let mut cmd_to_send = cmd_clean;
+                    cmd_to_send.push('\r'); // 追加 \r 触发下位机执行
+
+                    // 1. 开启静默模式 (过滤下位机回显)
+                    input_suppress.store(true, Ordering::SeqCst);
+
+                    // 2. 发送命令
+                    // 如果发送失败，返回错误以中断 race，触发外层重连
+                    if let Err(e) = req_send_console_cmd(interface, cmd_to_send.as_bytes()).await {
+                        // 发送失败也应该重置 flag，不过既然要重连了，不重置也没关系
+                        return Err(e);
+                    }
                 }
-            }
-            Err(e) => {
-                eprintln!("Stdin Error: {}", e);
-                break;
+                Err(e) => return Err(e),
             }
         }
-    }
+    };
 
-    logger_task.cancel().await;
-    Ok(())
+    smol::future::race(logger_task, input_task).await
 }
 
 // 2. 寄存器交互 Shell
 async fn run_reg_shell(interface: &nusb::Interface) -> io::Result<()> {
     println!("--- 寄存器交互模式 ---");
-    println!("用法:");
-    println!("  r <addr> <offset>          读取寄存器 (Addr + Offset)");
-    println!("  w <addr> <offset> <value>  写入寄存器 (Addr + Offset)");
-    println!("  exit / quit                退出");
+    println!("  r <addr> <offset>");
+    println!("  w <addr> <offset> <value>");
+    println!("  exit / quit");
     println!("------------------------");
 
     let stdin = io::stdin();
@@ -218,7 +267,6 @@ async fn run_reg_shell(interface: &nusb::Interface) -> io::Result<()> {
         io::stdout().flush()?;
         input_buf.clear();
 
-        // 读取一行输入
         if stdin.read_line(&mut input_buf).is_err() {
             break;
         }
@@ -227,170 +275,133 @@ async fn run_reg_shell(interface: &nusb::Interface) -> io::Result<()> {
         if line.is_empty() {
             continue;
         }
+
         let parts: Vec<&str> = line.split_whitespace().collect();
         match parts.as_slice() {
-            // 解析读指令
-            ["r", addr_str, offset_str] => {
-                let addr = match parse_hex_u16(addr_str) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        eprintln!("Read Err: {}", e);
-                        continue;
-                    }
-                };
-                let offset = match parse_hex_u16(offset_str) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        eprintln!("Read Err: {}", e);
-                        continue;
-                    }
-                };
-
-                match req_read_reg(interface, addr, offset).await {
-                    Ok(data) => {
-                        print!("[READ {:02X}::{:04X}] ", addr, offset);
-                        for b in data {
-                            print!("{:02X} ", b);
+            ["r", addr_s, off_s] => {
+                if let (Ok(addr), Ok(off)) = (parse_hex_u16(addr_s), parse_hex_u16(off_s)) {
+                    match req_read_reg(interface, addr, off).await {
+                        Ok(data) => {
+                            print!("[READ {:02X}::{:04X}] ", addr, off);
+                            for b in data {
+                                print!("{:02X} ", b);
+                            }
+                            println!();
                         }
-                        println!();
+                        Err(e) => {
+                            eprintln!("Read Error: {}", e);
+                            // 如果是严重错误，抛出以触发重连
+                            if is_fatal_error(&e) {
+                                return Err(e);
+                            }
+                        }
                     }
-                    Err(e) => eprintln!("Read Error: {}", e),
                 }
             }
-            // 解析写指令
-            ["w", addr_str, offset_str, val_str] => {
-                let addr = match parse_hex_u16(addr_str) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        eprintln!("{}", e);
-                        continue;
+            ["w", addr_s, off_s, val_s] => {
+                if let (Ok(addr), Ok(off), Ok(val)) = (
+                    parse_hex_u16(addr_s),
+                    parse_hex_u16(off_s),
+                    parse_hex_u16(val_s),
+                ) {
+                    match req_write_reg(interface, addr, off, val as u8).await {
+                        Ok(_) => println!("[WRITE] Done"),
+                        Err(e) => {
+                            eprintln!("Write Error: {}", e);
+                            if is_fatal_error(&e) {
+                                return Err(e);
+                            }
+                        }
                     }
-                };
-                let offset = match parse_hex_u16(offset_str) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        eprintln!("Write Error: {}", e);
-                        continue;
-                    }
-                };
-                let val = match parse_hex_u16(val_str) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        eprintln!("Write Error: {}", e);
-                        continue;
-                    }
-                };
-
-                // Value 只取低 8 位 (因为下位机是 & 0x00FF)
-                // Addr 只取低 8 位 (因为下位机是 & 0xFF00 >> 8，虽然我们传u16，但会被截断)
-                match req_write_reg(interface, addr, offset, val as u8).await {
-                    Ok(_) => {
-                        println!(
-                            "[WRITE {:02X}::{:04X} <= {:02X}] Done",
-                            addr, offset, val
-                        );
-                    }
-                    Err(e) => eprintln!("Write Error: {}", e),
                 }
             }
-            ["exit"] | ["quit"] | ["q"] => {
-                println!("Bye!");
-                break;
-            }
-            _ => {
-                eprintln!("格式错误: r <addr> <offset> 或 w <addr> <offset> <value>");
-            }
+            ["exit"] | ["quit"] | ["q"] => return Ok(()),
+            _ => eprintln!("指令格式错误"),
         }
     }
     Ok(())
 }
 
+fn is_fatal_error(e: &io::Error) -> bool {
+    // 根据实际情况判断，BrokenPipe 还可以是 ConnectionReset 等
+    match e.kind() {
+        io::ErrorKind::BrokenPipe
+        | io::ErrorKind::ConnectionAborted
+        | io::ErrorKind::NotConnected => true,
+        _ => false,
+    }
+}
+
 // ================= 底层 USB 请求封装 =================
 
-// [OUT] 0x22: 发送 Console 命令 (复用 SET_DBG_MSG)
-// 区别：Payload 不为空
 async fn req_send_console_cmd(interface: &nusb::Interface, data: &[u8]) -> io::Result<()> {
     let req = ControlOut {
         control_type: ControlType::Vendor,
         recipient: Recipient::Interface,
-        request: REQ_SET_DBG_MSG, // 0x22
+        request: REQ_SET_DBG_MSG,
         value: 0,
         index: 0,
-        data: data, // 发送字符串字节
+        data,
     };
     interface
-        .control_out(req, Duration::from_millis(200))
+        .control_out(req, Duration::from_millis(500))
         .await
         .map(|_| ())
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+        .map_err(to_io_err)
 }
 
-// [OUT] 0x22: 初始化日志
-// 区别：Payload 为空
 async fn req_set_dbg_msg_init(interface: &nusb::Interface) -> io::Result<()> {
     let req = ControlOut {
         control_type: ControlType::Vendor,
         recipient: Recipient::Interface,
-        request: REQ_SET_DBG_MSG, // 0x22
+        request: REQ_SET_DBG_MSG,
         value: 0,
         index: 0,
-        data: &[], // 空数据
+        data: &[],
     };
     interface
-        .control_out(req, Duration::from_millis(200))
+        .control_out(req, Duration::from_millis(500))
         .await
         .map(|_| ())
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+        .map_err(to_io_err)
 }
 
-// [IN] 0x12: 读寄存器
-// C代码: bus_map(setup->wValue, setup->wIndex)
-// 映射: wValue = Addr, wIndex = Offset
-// 返回: PACKET_LEN (8 bytes)
 async fn req_read_reg(interface: &nusb::Interface, addr: u16, offset: u16) -> io::Result<Vec<u8>> {
     let req = ControlIn {
         control_type: ControlType::Vendor,
         recipient: Recipient::Device,
-        request: REQ_GET_RD_REG, // 0x12
+        request: REQ_GET_RD_REG,
         value: addr,
         index: offset,
         length: 8,
     };
-    println!("addr{addr}, offset{offset}");
     interface
-        .control_in(req, Duration::from_millis(200))
+        .control_in(req, Duration::from_millis(500))
         .await
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+        .map_err(to_io_err)
 }
 
-// [IN] 0x11: 写寄存器
-// C代码: write_reg((setup->wValue & 0xFF00) >> 8, setup->wIndex, setup->wValue & 0x00FF)
-// 映射: wValue High=Addr, wValue Low=Value, wIndex=Offset
 async fn req_write_reg(
     interface: &nusb::Interface,
     addr: u16,
     offset: u16,
     val: u8,
 ) -> io::Result<Vec<u8>> {
-    // 构造 wValue: 高8位是地址，低8位是值
     let w_value = ((addr & 0xFF) << 8) | (val as u16);
-    println!("w_value{w_value}, offset{offset}");
-
     let req = ControlIn {
         control_type: ControlType::Vendor,
         recipient: Recipient::Device,
-        request: REQ_GET_WR_REG, // 0x11
-        value: w_value,          // 组合 Addr 和 Value
-        index: offset,           // Offset
+        request: REQ_GET_WR_REG,
+        value: w_value,
+        index: offset,
         length: 0,
     };
     interface
-        .control_in(req, Duration::from_millis(200))
+        .control_in(req, Duration::from_millis(500))
         .await
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+        .map_err(to_io_err)
 }
 
-// [IN] 0x10: 获取日志流
 async fn req_get_dbg_msg(interface: &nusb::Interface) -> io::Result<Vec<u8>> {
     let req = ControlIn {
         control_type: ControlType::Vendor,
@@ -400,8 +411,13 @@ async fn req_get_dbg_msg(interface: &nusb::Interface) -> io::Result<Vec<u8>> {
         index: 0,
         length: READ_BUFFER_SIZE,
     };
+    // 缩短超时时间以便更快响应，应用层 loop 会处理重试
     interface
-        .control_in(req, Duration::from_millis(200))
+        .control_in(req, Duration::from_millis(100))
         .await
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+        .map_err(to_io_err)
+}
+
+fn to_io_err<E: Into<Box<dyn std::error::Error + Send + Sync>>>(e: E) -> io::Error {
+    io::Error::new(io::ErrorKind::Other, e)
 }
