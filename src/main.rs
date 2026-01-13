@@ -5,7 +5,7 @@ use smol::io::AsyncBufReadExt;
 use std::io::{self, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // --- 厂商请求定义 ---
 // IN Requests
@@ -94,12 +94,38 @@ async fn async_main() {
     })
     .detach(); // detach 表示这个任务在后台一直运行
 
+    let mut err_kind = None;
+    let mut last_log_time = Instant::now();
+
     // 外层循环：支持断线重连
     loop {
         // 1. 尝试连接设备
         let interface = match find_and_open_device(cli.vid, cli.pid).await {
-            Ok(i) => i,
-            Err(_) => {
+            Ok(i) => {
+                while let Ok(_) = stdin_rx.try_recv() {}
+                println!(
+                    "设备{}成功",
+                    match err_kind {
+                        None => "连接".to_string(),
+                        _ => "重连".to_string(),
+                    }
+                );
+                i
+            }
+            Err(e) => {
+                let now = Instant::now();
+                let kind = e.kind();
+
+                if err_kind != Some(kind) || now.duration_since(last_log_time).as_secs() > 10 {
+                    last_log_time = now;
+                    err_kind = Some(kind);
+                    if kind == io::ErrorKind::NotFound {
+                        eprintln!("设备未连接，请检查设备连接...");
+                    } else {
+                        eprintln!("连接失败->{}，请检查设备连接...", e);
+                    }
+                }
+
                 smol::Timer::after(Duration::from_millis(1000)).await;
                 continue;
             }
@@ -119,8 +145,10 @@ async fn async_main() {
                 println!("会话结束。");
                 break;
             }
-            Err(_) => {
-                eprintln!("\n设备连接中断或发生错误。等待重连...");
+            Err(e) => {
+                last_log_time = Instant::now();
+                err_kind = Some(io::ErrorKind::NotFound);
+                eprintln!("\n设备连接中断->{}，请检查设备连接...", e);
             }
         }
     }
@@ -144,7 +172,6 @@ async fn find_and_open_device(vid: u16, pid: u16) -> io::Result<nusb::Interface>
         .await
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
-    println!("设备已连接！");
     Ok(interface)
 }
 
